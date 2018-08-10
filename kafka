@@ -1,0 +1,98 @@
+var uuid = require('uuid');
+var kafka = require('kafka-node');
+var console = require('./logModule');
+const ConsumerGroup = require('kafka-node/lib/consumerGroup');
+var host = process.env.ZK_HOSTS || 'gtwtqlapeapv01.gbt.gbtad.com:2181,gtwtqlapeapv02.gbt.gbtad.com:2181,gtwtqlapeapv03.gbt.gbtad.com:2181';
+var kafkaHost = process.env.UCP_KAFKA_HOSTS || 'gtwtqlapeapv01.gbt.gbtad.com:9092,gtwtqlapeapv02.gbt.gbtad.com:9092,gtwtqlapeapv03.gbt.gbtad.com:9092';
+global.console_log=global.console_log||function () {
+	var arr = Array.from(arguments);
+	arr = arr.concat(["flowName", "common", "serviceName", "ucp-node-common", "app", "ucp", "module", "common", "filename", "kafkaService"]);
+	console.log.apply(null, arr);
+}
+
+module.exports = {
+
+  // accept topicName, payloads, keyString ,sc, fc.
+  // payloads is array of messages.
+  // keyString is the name of key in each payload where some uniqueu uuid exists.
+  // if key is undefined or "", then generate uuid in this function and post it to topic.
+
+  produceToTopic: function (topicName, keyString, payloads, sc, fc) {
+    try{
+    var payloadArray = [];
+    var key;
+    for (var i = 0; i < payloads.length; i++) {
+      key = (payloads[i][keyString||'key']||uuid.v1());
+      payloadArray.push({ topic: topicName, key: key, messages: JSON.stringify(payloads[i]) });
+    }
+
+    var HighLevelProducer = kafka.HighLevelProducer, //,gtwtqlapeapv02.gbt.gbtad.com:2181,gtwtqlapeapv03.gbt.gbtad.com:2181
+      client = new kafka.KafkaClient({kafkaHost:kafkaHost,autoConnect:true,requestTimeout: 4000}),
+
+      producer = new HighLevelProducer(client,{
+        ackTimeoutMs:200
+        ,requireAcks:1
+        ,partitionerType: 1
+      });
+    
+      console_log("logLine", 'Payload for Kafka Queue is ready');
+    producer.on('ready', function () {
+      console_log("logLine", "Kafka.ready" + " Topic: " + topicName + " Size: " + payloadArray.length);
+      producer.send(payloadArray, function (err) {
+        if (err) {
+          console_log("kafkaError", 'Kafka producer error while sending Data to Topic: ' + topicName + ' Error: ' + err);
+          fc && fc(err);
+          return;
+        }
+        sc && sc(true);
+      })
+    })
+    }catch(Exc){
+      console_log("kafkaException", Exc);
+    }
+  },
+  consumeTopic: function (topicName, consumerGroupId, sc, fc) {
+    try{
+    var options = {
+      host: host,  // zookeeper host omit if connecting directly to broker (see kafkaHost below)
+      kafkaHost: kafkaHost, // connect directly to kafka broker (instantiates a KafkaClient)
+      zk: undefined,   // put client zk settings if you need them (see Client)
+      batch: undefined, // put client batch settings if you need them (see Client)
+      ssl: true, // optional (defaults to false) or tls options hash
+      groupId: consumerGroupId,
+      sessionTimeout: 15000,
+      protocol: ['roundrobin'],
+      fromOffset: 'latest', // default
+      outOfRangeOffset: 'earliest', // default
+      migrateHLC: false,    // for details please see Migration section below
+      migrateRolling: true,
+      id: process.env.HOSTNAME,
+      memberId: process.env.HOSTNAME
+    };
+    var consumerGroup = new ConsumerGroup(options, topicName);
+    consumerGroup.on('message', function (message) {
+      console_log("payload", JSON.stringify(message));
+      sc && sc(message);
+    });
+
+    consumerGroup.on('error', function (err) {
+      fc && fc(err);
+      return;
+    })
+
+
+    consumerGroup.on('connect', function () {
+      console_log("logLine", 'Kafka Consumer connected to topic: ' + topicName);
+    });
+
+    process.once('SIGINT', function () {
+      console_log("logLine", 'Kafka Consumer responding to SIGINT ');
+      async.each([consumerGroup], function (consumer, callback) {
+        consumer.close(true, callback);
+      });
+    });
+  }catch(Exc){
+      console_log("kafkaException", Exc);
+  }
+  }
+};

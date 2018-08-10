@@ -1,0 +1,252 @@
+var express = require('express');
+var assert = require('assert');
+var app = express();
+var bodyParser = require('body-parser');
+var helmet = require('helmet');
+var request = require("request");
+var moment = require('moment');
+var db = require('./cassandraDB');
+var console = require("./logModule");
+const NS_PER_SEC = 1e9;
+//environment variables
+var deubgFlag = process.env.DEBUG;
+
+app.use(helmet());
+
+var rawBodySaver = function (req, res, buf, encoding) {
+  if (buf && buf.length) {
+    req.rawBody = buf.toString(encoding || 'ascii');
+  }
+}
+
+
+app.use(bodyParser.urlencoded({ verify: rawBodySaver, extended: true }));
+app.use(bodyParser.raw({ verify: rawBodySaver, type: '*/*' }));
+
+//Date Conversion for ExpertCare
+function dateConvert(s) {
+  return moment(Date.parse(s)).utc().format("ddd, DD MMM YYYY HH:mm:ss ZZ");
+}
+var post2App = function (url, apikey, payload, sc, fc) {
+  if (url && url != "") {
+    var headers = {
+      "content-type": "application/json", "cache-control": "no-cache",
+    };
+    if (apikey && apikey != "") {
+      if (apikey.startsWith("Authorization")) {
+        headers['Authorization'] = apikey.substring("Authorization".length + 1);
+      } else {
+        headers.apikey = apikey;
+      }
+    }
+    var _options = {
+      "method": "POST",
+      "url": url,
+      "port": 443,
+      "headers": headers
+    };
+    var post_data = JSON.stringify(payload);
+    _options.body = post_data;
+    console.log("requestDetail", _options);
+    var req = request(_options, function (err, response, responseBody) {
+      if (err) {
+        console.log("responseError", err);
+        if (fc) {
+          (fc)(err);
+        }
+      } else {
+        console.log("response", responseBody);
+        if (sc) {
+          (sc)(responseBody);
+        }
+      }
+    });
+  } else {
+    if (fc) {
+      (fc)("Invalid URL");
+    }
+  }
+
+};
+var autoResponses = require("./rules") || {
+  "82230": {
+    "OPT-IN": "Welcome! Msg freq varies by user. Msg&Data rates may apply. Reply END to cancel. Terms: amexglobalbusinesstravel.com/digitalterms",
+    "OPT-OUT": "You are unsubscribed will no longer receive alert msgs. Reply OPT-IN to re-enrol.  Terms: amexglobalbusinesstravel.com/digitalterms"
+  }, "447537415020": {
+    "OPT-IN": "Welcome! Msg freq varies by user. Msg&Data rates may apply. Reply END to cancel. Terms: amexglobalbusinesstravel.com/digitalterms",
+    "OPT-OUT": "You are unsubscribed will no longer receive alert msgs. Reply OPT-IN to re-enrol.  Terms: amexglobalbusinesstravel.com/digitalterms"
+  }
+};
+String.prototype.startsWith = function (val) {
+  return this.substring(0, val.length) == val;
+};
+var routeSMSTextPrefix = process.env.SMS_ROUTING_PREFIX || "QAPL";
+app.post('/', function (req, res) {
+  var startTime = process.hrtime();
+  var body = req.body;
+  var rawBody = req.rawBody;
+  var smsFrom = body.smsfrom;
+  var smsTo = body.smsto;
+  var messageId = body.smsid;
+  var extTime = 0;
+  var dbTime = 0;
+  //console.log("Received message...body", body);
+  //console.log("Received message...rawBody", rawBody);
+  //console.log("smsBody", body.smsmsg);
+  var smsmsg = (body.smsmsg.startsWith(routeSMSTextPrefix)) ? body.smsmsg.substring(routeSMSTextPrefix.length).trim() : body.smsmsg.trim();
+  //console.log("Received SMS....", smsmsg);
+  //Auto Responses.
+  if (autoResponses[smsTo] && autoResponses[smsTo][smsmsg]) {
+    //console.log("Auto Response Available for SMS Code..." + body.smsto);
+    var resText = autoResponses[smsTo][smsmsg];
+    console.log("AutoResponse" + resText);
+    //console.log("POST SMS to..." + process.env.SENDSMS_WEBHOOK_URL + "..." + process.env.SENDSMS_WEBHOOK_APIKEY);
+    //send resText
+    var extStartTime = process.hrtime();
+    post2App(process.env.SENDSMS_WEBHOOK_URL, process.env.SENDSMS_WEBHOOK_APIKEY, {
+      fromAddress: smsTo,
+      toAddress: smsFrom,
+      text: resText,
+      tags: ["sms", "syniverse"]
+    }, function (body) {
+      console.log("smsSuccess", body);
+      extTime = getTimeTaken(extStartTime);
+      sendResponse(smsFrom, smsTo, messageId, startTime, dbTime, extTime, 200, res);
+      //res.sendStatus(200);
+    }, function (err) {
+      console.log("smsFailed", err);
+      extTime = getTimeTaken(extStartTime);
+      sendResponse(smsFrom, smsTo, messageId, startTime, dbTime, extTime, 200, res);
+      //res.sendStatus(200);
+    });
+  } else {
+    //boolean flag from environment variables for Charter or by default Charter doesn't Exist i.e. it is decomissioned.
+    var charterDecomm = process.env.CHARTER_DECOMISSIONED || true;
+    var msgFlag = false;
+    if (smsmsg == 'Y' || smsmsg == 'N' || smsmsg == 'S' || smsmsg == 'J' || smsmsg == 'O') {
+      msgFlag = true;
+    }
+
+    var func2Charters = function () {
+      //Send to Charter
+      post2App(process.env.CHARTERS_WEBHOOK_URL, process.env.CHARTERS_WEBHOOK_APIKEY, rawBody, function (body1) {
+        console.log("sentTo", "Charters");
+        extTime = getTimeTaken(extStartTime);
+        sendResponse(smsFrom, smsTo, messageId, startTime, dbTime, extTime, 200, res);
+      }, function (err) {
+        console.log("errorCharters", err);
+        extTime = getTimeTaken(extStartTime);
+        sendResponse(smsFrom, smsTo, messageId, startTime, dbTime, extTime, 200, res);
+      });
+    };
+
+    var func2EXCA = function () {
+      //send to Expert Care
+      //var extStartTime = process.hrtime();
+      console.log("sentTo", "Expert Care");
+      post2App(process.env.EXCA_WEBHOOK_URL, process.env.EXCA_WEBHOOK_APIKEY, (process.env.EXCA_SCHEMA == 1) ? [
+        { "msys": { "relay_message": { "protocol": "http", "to": smsTo, "date": dateConvert(body.smsdate), "from": smsFrom, "text": smsmsg, "externalUserId": null, "customer_id": "1", "webhook_id": "" } } }]
+        : {
+          fromAddress: smsFrom
+          , toAddress: smsTo
+          , text: smsmsg
+          , recordedAt: body.smsdate
+          , messageId: messageId
+          , network: body.networkk
+          , encoding: body.encoding
+        }, function (body) {
+          extTime = getTimeTaken(extStartTime);
+          sendResponse(smsFrom, smsTo, messageId, startTime, dbTime, extTime, 200, res);
+          //res.sendStatus(200);
+        }, function (err) {
+          extTime = getTimeTaken(extStartTime);
+          sendResponse(smsFrom, smsTo, messageId, startTime, dbTime, extTime, 200, res);
+          //res.sendStatus(200);
+        });
+    };
+
+    var func2PTC = function () {
+      //Send to PTC
+      //var extStartTime = process.hrtime();
+      post2App(process.env.PTC_WEBHOOK_URL, process.env.PTC_WEBHOOK_APIKEY, {
+        fromAddress: smsFrom
+        , toAddress: smsTo
+        , text: smsmsg
+        , recordedAt: new Date(Date.parse(body.smsdate)).toISOString()
+        , messageId: messageId
+        , network: body.network
+        , encoding: body.encoding
+      }, function (body) {
+        console.log("sentTo", "PTC");
+        // extTime = getTimeTaken(extStartTime);
+        // sendResponse(smsFrom, smsTo, messageId, startTime, dbTime, extTime, 200, res);
+      }, function (err) {
+        console.log("errorPTC", err);
+        // extTime = getTimeTaken(extStartTime);
+        //sendResponse(smsFrom, smsTo, messageId, startTime, dbTime, extTime, 200, res);
+      });
+    };
+
+
+    //fetch Mobile record from MobileRegistry DataBase
+    var dbStartTime = process.hrtime();
+    db.getMobile(smsFrom, function (result) {
+      if (result) {
+        dbTime = getTimeTaken(dbStartTime);
+        var data = result;
+        console.log("dbResult", data);
+        var extStartTime = process.hrtime();
+        if (charterDecomm) {
+          func2PTC();
+          func2EXCA();
+        } else {
+          if (data.exca) {
+            func2EXCA();
+          } else {
+            //send to Charters
+            func2Charters();
+          }
+        }
+      }
+      else {
+        dbTime = getTimeTaken(dbStartTime);
+        //send to Charters
+        func2Charters();
+      }
+    }, function (err) {
+      console.log("dataBaseError", err);
+      dbTime = getTimeTaken(dbStartTime);
+      //send to Charters
+      func2Charters();
+    })
+  }
+  //1. garabagge collector
+  try {
+    global.gc();
+  } catch (e) {
+    console.log("catchGC", "You must run program with 'node --expose-gc index.js' or 'npm start'");
+    process.exit();
+  }
+
+  //2. Output Heap stats
+  var heapUsed = process.memoryUsage().heapUsed;
+  console.log("heapUsed", "Program is using " + heapUsed + " bytes of Heap.")
+
+});
+
+function sendResponse(from, to, messageId, startTime, dbTime, extTime, responseCode, res) {
+  var resTime = getTimeTaken(startTime);
+  console.log("fromAddress", from, "toAddress", to, "messageId", messageId, "responseTime", resTime, "dbResponseTime", dbTime, "extResponseTime", extTime, "responseCode", responseCode);
+  res.sendStatus(responseCode);
+}
+
+function getTimeTaken(startTime) {
+  var diff = process.hrtime(startTime);
+  var time_ns = diff[0] * NS_PER_SEC + diff[1];
+  //var timeTaken = time_ns + ' ns';
+  return time_ns;
+}
+
+app.listen(8080, function () {
+  console.log("startupPort", 8080);
+});

@@ -1,0 +1,70 @@
+var fs = require('fs');
+var path = require('path');
+var log4js = require('log4js'); // include log4js
+var consoleLogs = process.env.CONSOLE_LOGS || 'false';
+console.log("Log to Console:",consoleLogs);
+var logFileSize = process.env.LOGFILE_SIZE || 500000000; //500000000 = 500MB
+var directory = '/logs/RT/json/'+process.env.HOSTNAME+'/';
+const targetDir = directory;
+const sep = path.sep;
+const initDir = path.isAbsolute(targetDir) ? sep : '';
+var _console_log = console.log;
+targetDir.split(sep).reduce((parentDir, childDir) => {
+  const curDir = path.resolve(parentDir, childDir);
+  if (!fs.existsSync(curDir)) {
+    fs.mkdirSync(curDir);
+  }
+  return curDir;
+}, initDir);
+_console_log("Creating Log file if not exists.");
+fs.writeFileSync(directory + "ucp-microservice.log", "{}\n", { flag:'a'} );
+_console_log("Created Log file if not exists.");
+try{
+  fs.chmodSync(directory+"/ucp-microservice.log",0777);
+}catch(e){
+  _console_log("Unable to set permission on Log file.");
+}
+_console_log("Created Log file Set Permissions...",fs.statSync(directory+"/ucp-microservice.log").mode);
+log4js.addLayout('json', config => {
+  return function(logEvent) { return JSON.stringify(logEvent) + config.separator; }
+});
+log4js.configure({ // configure to use all types in different files.
+    appenders: {
+        applogs: {
+             type: 'ucp-node-commons/customLogModule', //customized log module for adding more attributes into file appender.
+            layout: { type: 'json', separator: '' },
+            filename: directory + "ucp-microservice.log",
+            maxLogSize: logFileSize, 
+            mode: 0o777,
+        }
+    },
+    categories: {
+        default: { appenders: ['applogs'], level: 'info'}
+    }
+});
+var logger = log4js.getLogger();
+
+global.now=function(){
+  var now = new Date();
+  var now_utc = new Date(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(),  now.getUTCHours(), now.getUTCMinutes(), now.getUTCSeconds(),now.getUTCMilliseconds());
+  return now_utc.toISOString();
+}
+module.exports = {
+  logData: function (msg) {
+    _console_log(msg);
+  },
+  log: function(){
+    // Arguments should be even number.
+    // in format of key1,value1,key2,value2,key3,value3,...keyn,valuen
+    //
+    var args=arguments;
+    var obj={};
+    for(var i=0;i<args.length-1;i+=2){
+      obj[args[i]]=args[i+1];
+    }
+    logger.info(JSON.stringify(obj)+'\n');
+    if(consoleLogs==='true'){
+      _console_log(JSON.stringify(obj));
+    }
+  }
+};

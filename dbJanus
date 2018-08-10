@@ -1,0 +1,384 @@
+var dbi = require("./dbi");
+var gremlin = require('gremlin');
+var uuid = require('uuid');
+var utils = require('./util');
+var _ = require("lodash");
+var assert = require('assert');
+var console = require('./logModule');
+global.console_log = global.console_log || function () {
+	var arr = Array.from(arguments);
+	arr = arr.concat(["flowName", "common", "serviceName", "ucp-node-commons", "app", "ucp", "module", "sms","filename","app"]);
+	console.log.apply(null, arr);
+}
+global.nowTS = function () {
+    var now = new Date();
+    var now_utc = new Date(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), now.getUTCHours(), now.getUTCMinutes(), now.getUTCSeconds(), now.getUTCMilliseconds());
+    return now_utc.getTime();
+}
+global.nowTSByOffset = function (d) {
+    var now = new Date();
+    var now_utc = new Date(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), now.getUTCHours(), now.getUTCMinutes(), now.getUTCSeconds(), now.getUTCMilliseconds());
+    now_utc.setUTCDate(now_utc.getUTCDate()+d);
+    return now_utc.getTime();
+}
+
+global.now = function () {
+    var now_utc = new Date(global.nowTS());
+    return now_utc.toISOString();
+}
+global.nowByOffset = function (d) {
+    var now_utc = new Date(global.nowTSByOffset(d));
+    return now_utc.toISOString();
+}
+global.escapeThis=function(kk){
+    return (kk && kk.replace)?kk.replace(/'/g,"\\'"):kk;
+}
+var request = require('request');
+function DBJanus(options) {
+    return _.assign(dbi, {
+        options: options
+        , context: {}
+        , connect: function (opts, sc, fc) {
+            var _this = this;
+            try {
+                var client = {};
+                _this.context = { db: client };
+                sc && sc({ db: client });
+            } catch (err) {
+                console_log("dbConnectError",err);
+                fc && fc("Could not connect to database");
+                return;
+            }
+        }, close: function (context, sc, fc) {
+            try {
+                sc && sc();
+            } catch (ee) {
+                fc && fc("Error while closing database");
+            }
+        }, executeQueryWS: function (_qry, sc, fc) {
+            var qry = (_qry && _qry.join) ? _qry.join("\n") : _qry;
+            console_log("query", qry);
+            this.context.db.execute(qry, (err, results) => {
+                if (!err) {
+                    var res = this.r2o(results)
+                    sc && sc(res, results, qry);
+                    return;
+                }
+                (fc && fc(err));
+            });
+        }, executeQuery: function (_qry, sc, fc) {
+            this.executeQueryEach(_qry,sc,fc,1,5);
+        }, executeQueryEach: function (_qry, sc, fc,retryIdx,retries) {
+            var qry = (_qry && _qry.join) ? _qry.join(";") : _qry;
+            var _this = this;
+            console_log("metaInfo","Q:["+retryIdx+"/"+retries+"]...","query", qry);
+            var options = this.options;
+            var _options = {
+                "method": "POST",strictSSL:false,followRedirect:true,followAllRedirects:true,followOriginalHttpMethod:true,
+                "url": (options.dbProtocol||"http")+"://" + options.dbURL +":"+ options.dbPort,
+                "headers": {"content-type": "application/json", "cache-control": "no-cache"},"json": true,
+              };
+            _options.body = {"gremlin":qry};
+            console_log("query_request_begin",_options);
+            var tics=utils.ticks.begin('Q:'+qry);
+              request(_options, function (err, response, body2) {
+                if ((!(response && (response.statusCode === 200 || response.statusCode === 201))) || err) {
+                    console_log("query_request_end1", tics.end().dump());
+                    if(err){
+                        console_log("error",err);
+                    }else if(response && response.body){
+                        console_log("queryResponseStatusCode", response && response.statusCode);
+                        if(Array.isArray(response.body.exceptions) && response.body.exceptions.indexOf("org.janusgraph.diskstorage.locking.PermanentLockingException")>=0){
+                            console_log("lockExceptionExist", true);
+                        }
+                        if(response.statusCode ===   500 && Array.isArray(response.body.exceptions) && response.body.exceptions.indexOf("java.util.concurrent.TimeoutException")>=0 && retries>retryIdx){
+                            setTimeout(()=>{
+                                _this.executeQueryEach(_qry,sc,fc,++retryIdx,retries);
+                            },100);
+                            return;
+                        }
+                    }
+                    fc && fc(err||response);
+                } else {
+                    console_log("query_request_end2",tics.end().dump());
+                    sc && sc(_this.r2o(body2.result.data));
+                }
+              });
+        }, r2o: function (o) {
+            if (o ===  null) {
+                return o;
+            }
+            var i,rr,k;
+            if (Array.isArray(o)) {
+                rr = [];
+                for (i = 0; i < o.length; i++) {
+                    rr.push(this.r2o(o[i]));
+                }
+                return rr;
+            }
+            if (o._list) {
+                return { list: this.r2o(o._list), count: o._total };
+            }
+            if (o.properties) {
+                rr = { "_label": o.label, "_id": o.id };
+                for (k in o.properties) {
+                    if (!o.properties.hasOwnProperty(k)) {continue;}
+                    var kk = o.properties[k];
+                    if (kk.length ===  1) {
+                        rr[k] = kk[0].value;
+                    } else if (kk.length > 1) {
+                        rr[k] = [];
+                        for (i = 0; i < kk.length; i++) {
+                            rr[k].push(kk[i].value);
+                        }
+                    }
+                }
+                return rr;
+            }else if(typeof o !==  'object'){
+                return o;
+            }else if(typeof o.type ===  'undefined'){
+                var ob={};
+                for(k in o){
+                    if (!o.hasOwnProperty(k)) {continue;}
+                    if(Array.isArray(o[k]) || typeof o[k] ===  'object'){
+                        ob[k]=this.r2o(o[k]);
+                    }else{
+                        ob[k]=o[k];
+                    }
+                }
+                return ob;
+            }
+        }, assertContext: function (context, sc, fc) {
+            var _this = this;
+            if (context && context.db) {
+                sc && sc.call(_this, context);
+            } else {
+                this.connect(this.options, function (ctx) {
+                    sc && sc.call(_this, ctx);
+                }, fc);
+            }
+        }, o2c: function (o) {
+            var r = [];
+            for (var k in o) {
+                if (!o.hasOwnProperty(k)) {continue;}
+                var kk = o[k];
+                if(typeof kk ===  'number'||typeof kk ===  'boolean'){
+                    r.push("'"+k+"',"+kk+"");
+                }else if(Array.isArray(kk)){
+                    for(var i=0;i<kk.length;i++){
+                        if(typeof kk ===  'number'||typeof kk ===  'boolean'){
+                            r.push("'"+k+"',"+kk[i]+"");
+                        }else{
+                            r.push("'"+k+"','"+escapeThis(kk[i])+"'");
+                        }
+                    }
+                }else {
+                    r.push("'"+k+"','"+escapeThis(kk)+"'");
+                }
+            }
+            return r.join(",");
+        }, o2u: function (o,sideEffect) {
+            var r = [];
+            for (var k in o) {
+                if (!o.hasOwnProperty(k)) {continue;}
+                var kk = o[k];
+                if(typeof kk ===  'number'||typeof kk ===  'boolean'){
+                    r.push(".property('"+k+"',"+kk+")");
+                }else if(Array.isArray(kk)){
+                    r.push(".sideEffect(properties('"+k+"').drop())");
+                    for(var i=0;i<kk.length;i++){
+                        if(typeof kk ===  'number'||typeof kk ===  'boolean'){
+                            r.push(".property('"+k+"',"+kk[i]+")");
+                        }else{
+                            r.push(".property('"+k+"','"+escapeThis(kk[i])+"')");
+                        }
+                    }
+                }else {
+                    r.push(".property('"+k+"','"+escapeThis(kk)+"')");
+                }
+            }
+            return (sideEffect && r.length>0)?(".sideEffect("+r.join("").substring(1)+")"):r.join("");
+        }, o2f: function (o) {
+            var r = [];
+            for (var k in o) {
+                if (!o.hasOwnProperty(k)) {continue;}
+                var kk = o[k];
+                if(typeof kk ===  'number'||typeof kk ===  'boolean'){
+                    r.push(".has('" + k + "'," + kk + ")");
+                } else {
+                    r.push(".has('" + k + "','" + escapeThis(kk) + "')");
+                }
+            }
+            return r.join("");
+        }, CRUDL: function (label, extra) {
+            return _.extend({
+                _core: this
+                , get: function (opts, sc, fc) {
+                    this._core.assertContext(this._core.context, function () {
+                        this.executeQuery("gv=g.V().hasLabel('" + label + "').has('_status',neq('deleted'))" + this.o2f(opts.filter) + ".range(" + (opts.pi.f || 0) + "," + (opts.pi.s || 200) + ")\ngv", sc, fc);
+                    }, fc);
+                }, getSorted: function (opts, sc, fc) {
+                    this._core.assertContext(this._core.context, function () {
+                        this.executeQuery("gv=g.V().hasLabel('" + label + "').has('_status',neq('deleted'))" + this.o2f(opts.filter) + ".order().by('"+opts.orderBy+"',"+opts.orderType+").range(" + (opts.pi.f || 0) + "," + (opts.pi.s || 200) +")\ngv", sc, fc);
+                    }, fc);
+                }, execAny: function (opts, sc, fc) {
+                    this._core.assertContext(this._core.context, function () {
+                        this.executeQuery(opts.qry, sc, fc);
+                    }, fc);
+                }, create: function (opts, sc, fc) {
+                    opts.data.createdDate = now();
+                    opts.data.updatedDate = now();
+                    opts.data.createdTS = nowTS();
+                    opts.data.updatedTS = nowTS();
+                    opts.data._status = 'new';
+                    opts.data.rId = uuid.v1();
+                    this._core.assertContext(this._core.context, function () {
+                        this.executeQuery("cv=graph.addVertex(T.label,'" + label + "'," + this.o2c(opts.data) + ")\ngraph.tx().commit()\ncv", sc, fc);
+                    }, fc);
+                },
+                update: function (opts, sc, fc) {
+                    opts.data.updatedDate = now();
+                    opts.data.updatedTS = nowTS();
+                    this._core.assertContext(this._core.context, function () {
+                        
+                        this.executeQuery([
+                            "fv=g.V().hasLabel('" + label + "').has('_status',neq('deleted'))" + this.o2f(opts.filter) + ""
+                            , "fv" + this.o2u(opts.data) + ""
+                            , "graph.tx().commit()"
+                            , "fv"
+                        ], sc, fc);
+                    }, fc);
+                },
+                delete: function (opts, sc, fc) {
+                    opts.data._status = 'deleted';
+                    opts.data.deletedDate = now();
+                    this.update(opts, sc, fc);
+                },
+                purge: function (opts, sc, fc) {
+                    this._core.assertContext(this._core.context, function () {
+                        
+                        //Add condition to check the purge date.
+                        this.executeQuery("g.V().hasLabel('" + label + "').has('_status','deleted')" + this.o2f(opts.filter) + ".drop();", sc, fc);
+                    }, fc);
+                }
+            }, extra || {});
+        }, Communications: function () {
+            return this.CRUDL('Communication', {
+                postRecorderData: function (opts, sc, fc) {
+                    var currentts = now();
+                    var nwTS = nowTS();
+                    opts.data.comm.createdDate = currentts;
+                    opts.data.comm.updatedDate = currentts;
+                    opts.data.comm._status = 'new';
+                    opts.data.comm.rId = uuid.v1();
+                    opts.data.comm.createdTS = nwTS;
+                    opts.data.comm.updatedTS = nwTS;
+                    
+                    var statusData = {
+                        'status': opts.data.comm.status,
+                        'statusMeta': opts.data.comm.statusMeta,
+                        'createdDate': currentts,
+                        'createdTS': nwTS,
+                        'destination': opts.data.comm.destinationAddr,
+                        'conversationId': opts.data.comm.conversationId,
+				        'messageId': opts.data.comm.messageId
+                    };
+                    this._core.assertContext(this._core.context, function () {
+                        this.executeQuery([
+                            "nvC=graph.addVertex(T.label,'Communication'," + this.o2c(opts.data.comm) + ")"
+                            , "nvCES=graph.addVertex(T.label,'CommunicationEventStatus'," + this.o2c(statusData) + ")"
+                            //, "g.V(nvC).next().addEdge('eventstatus',g.V(nvCES).next())"
+                            , "graph.tx().commit()"
+                            , "nvC"], sc, fc);
+                    }, fc);
+                }
+        
+                ,postEventStatus: function (opts, sc, fc) {
+                    var id = uuid.v1();
+                    opts.data.updatedDate = now();
+                    opts.data.updatedTS = nowTS();
+                    var dataCE = opts.data;
+                    dataCE.createdDate = now();
+                    dataCE.createdTS = nowTS();
+                    dataCE._status = 'new';
+                    dataCE.rId = id;
+                    var statusFilter = {rId: id}
+                    this._core.assertContext(this._core.context, function () {
+                        
+                        this.executeQuery([
+                             "fv=g.V().hasLabel('Communication').has('_status',neq('deleted'))" + this.o2f(opts.filter) + ""
+                            , "fv" + this.o2u(opts.data) + ""
+                            ,"idz=fv.valueMap('conversationId','messageId')[0];nv=graph.addVertex(T.label,'CommunicationEventStatus'," + this.o2c(dataCE) + ",'externalTrackingId','"+opts.data.externalTrackingId+"','conversationId',idz.conversationId,'messageId',idz.messageId)"
+                            , "graph.tx().commit()"
+                            , "nv"], sc, fc);
+                    }, fc);
+                }
+                ,getSourceSystems: function(opts, sc, fc){
+                    this._core.assertContext(this._core.context, function () {
+                        this.executeQuery([
+                            "outV=g.V()" +".has('createdDate',gt('"+global.nowByOffset(opts.daysOffset||-7)+"'))"+ this.o2f(opts.filter) + ".has('_status',neq('deleted')).hasLabel('Communication').values('"+opts.values +"').dedup()"
+                            , "outV"], sc, fc);
+                    }, fc);
+                }
+                ,getLatestOut: function(opts, sc, fc){
+                    this._core.assertContext(this._core.context, function () {
+                        this.executeQuery([
+                            "outV=g.V().hasLabel('Communication').has('_status',neq('deleted')).has('externalTrackingId',neq(''))" + this.o2f(opts.filter) + ".order().by('"+opts.orderBy+"',"+opts.orderType+").range(" + (opts.pi.f || 0) + "," + (opts.pi.s || 200) +")"
+                            , "outV"], sc, fc);
+                    }, fc);
+                }
+                ,getRecord: function(opts, sc, fc){
+                    this._core.assertContext(this._core.context, function () {
+                        
+                        this.executeQuery([
+                            "outV=g.V()" + this.o2f(opts.filter) + ".has('_status',neq('deleted')).hasLabel('Communication')"
+                            , "outV"], sc, fc);
+                    }, fc);
+                }
+                ,createInOutEdge: function (opts, sc, fc) {
+                    this._core.assertContext(this._core.context, function () {
+                        
+                        this.executeQuery([
+                             "fiV=g.V().hasLabel('Communication').has('_status',neq('deleted'))" + this.o2f(opts.filter) + ""
+                            ,"fiV" + this.o2u(opts.inUpdate) + ""
+                            ,"g.V("+opts.outId+")"+ this.o2u(opts.outUpdate) +".next().addEdge('reply',fiV.next())"
+                            , "graph.tx().commit()"
+                            , "fiV"], sc, fc);
+                    }, fc);
+                }
+                ,createAppRouting: function (opts, sc, fc) {
+                    this._core.assertContext(this._core.context, function () {
+                        
+                        this.executeQuery([
+                            "nv=graph.addVertex(T.label,'AppRouting'," + this.o2c(opts.data) + ")"
+                            ,"fV=g.V().hasLabel('Communication').has('_status',neq('deleted'))" + this.o2f(opts.filter) + ""
+                            ,"fv.next().addEdge('eventstatus',g.V(nv).next())"
+                            , "graph.tx().commit()"
+                            , "nv"], sc, fc);
+                    }, fc);
+                }
+            });
+        }, ConsumerSubscriptions: function () {
+            return this.CRUDL('ConsumerSubscription', {});
+        }, RuleGroups: function () {
+            return this.CRUDL('RuleGroup', {});
+        }, ChannelConfigurations: function () {
+            return this.CRUDL('ChannelConfiguration', {});
+        }, SMSCodes: function () {
+            return this.CRUDL('SMSCode', {});
+        }, Conversations: function () {
+            return this.CRUDL('Conversation', {});
+        }, ConsumerConfigurations: function () {
+            return this.CRUDL('ConsumerConfiguration', {});
+        }, ResourceUsage: function () {
+            return this.CRUDL('ResourceUsage', {});
+        }, SubscriberLog: function () {
+            return this.CRUDL('SubscriberLog', {});
+        }, BatchImport: function (){
+            return this.CRUDL('BatchImport', {});
+        }, BatchImportDetail: function (){
+            return this.CRUDL('BatchImportDetail', {});
+        }
+    });
+};
+module.exports = DBJanus;

@@ -1,0 +1,176 @@
+var console = require('./logModule');
+var Validator = require('validator-json');
+const crypto = require('crypto');
+var request = require('request');
+var fs = require('fs');
+var https = require('https');
+var URL = require('url');
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || 'TravelExprBusinessAmericanGlobal'; // Must be 256 bytes (32 characters)
+const IV_LENGTH = 16; // For AES, this is always 16
+global.console_log = global.console_log || function () {
+	var arr = Array.from(arguments);
+	arr = arr.concat(["flowName", "common", "serviceName", "ucp-node-common", "app", "ucp", "module", "common", "filename", "util"]);
+	console.log.apply(null, arr);
+}
+
+module.exports = {
+  ticks:{
+    _arr:{}
+    ,_start:0
+    ,_end:0,_k:""
+    ,begin:function(k){this._k=k;this._start = process.hrtime();return this;}
+    ,end:function(){this._end = process.hrtime(this._start);return this;}
+    ,dump:function(){return ""+this._end[0] + "s, " + (this._end[1]/ 1000000).toFixed(4) + "ms - " + this._k;}
+  },
+  validate: function (input, schema, sc, fc) {
+    let validator = new Validator(input, schema);
+    let errors = validator.validate()
+    if (errors.length > 0) {
+      console_log("logLine", 'Validation failed with Error: ' + errors);
+      fc && fc(errors);
+      return
+    };
+    console_log("logLine", 'Validation success');
+    sc && sc(true);
+  },
+  now: function () {
+    var now = new Date();
+    var now_utc = new Date(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), now.getUTCHours(), now.getUTCMinutes(), now.getUTCSeconds(), now.getUTCMilliseconds());
+    return now_utc.toISOString();
+  },
+  nowTS: function () {
+    var now = new Date();
+    var now_utc = new Date(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), now.getUTCHours(), now.getUTCMinutes(), now.getUTCSeconds(), now.getUTCMilliseconds());
+    return now_utc.getTime();
+  },
+  encrypt: function (text) {
+    let iv = crypto.randomBytes(IV_LENGTH);
+    let cipher = crypto.createCipheriv('aes-256-cbc', new Buffer(ENCRYPTION_KEY), iv);
+    let encrypted = cipher.update(text);
+
+    encrypted = Buffer.concat([encrypted, cipher.final()]);
+
+    return iv.toString('hex') + ':' + encrypted.toString('hex');
+  },
+
+  decrypt: function (text) {
+    let textParts = text.split(':');
+    let iv = new Buffer(textParts.shift(), 'hex');
+    let encryptedText = new Buffer(textParts.join(':'), 'hex');
+    let decipher = crypto.createDecipheriv('aes-256-cbc', new Buffer(ENCRYPTION_KEY), iv);
+    let decrypted = decipher.update(encryptedText);
+
+    decrypted = Buffer.concat([decrypted, decipher.final()]);
+
+    return decrypted.toString();
+  },
+  post2App: function(_url, apikey, proxy, payload, sc, fc) {
+    if (_url && _url!=="") {
+      var headers = {
+        "content-type": "application/json", "cache-control": "no-cache",
+      };
+      if (apikey && apikey!=="") {
+        if (apikey.startsWith("Authorization")) {
+          headers['Authorization'] = apikey.substring("Authorization".length + 1);
+        } else {
+          headers.apikey = apikey;
+        }
+      }
+      var _options = {
+        "method": "POST",
+        "url": _url,
+        "headers": headers
+      };
+      if (proxy && proxy!=="") {
+        _options.proxy = proxy;
+      }
+      var rnd=Math.random();
+      var post_data = JSON.stringify(payload);
+      global.console_log("["+rnd+"]POST["+_url+"]",post_data);
+      var url=URL.parse(_url);
+      if(url.protocol === "https:"){ 
+      var httpsReq = https.request({ 
+          host: url.host, 
+          port: url.port,
+          path: url.pathname || '/',
+          method: 'POST',
+          protocol: url.protocol,
+          headers: headers,
+          ca: fs.readFileSync(__dirname + '/amexgbt.pem')
+      }, function(resp){
+          var body = [];
+          resp.on('data', function(data){
+              body.push(data);
+          });
+          resp.on('end', function(){
+            var _body = body.join('');
+            global.console_log("["+rnd+"]POST["+url+"]["+resp.statusCode+"]Response:",_body);
+            if (sc) {
+              (sc)({ "Success": { "code": resp.statusCode, "body": _options } });
+              return;
+            }
+          });
+      });
+      httpsReq.on('error', function(err){
+          if (fc) {
+            fc({ "Error": { "code": err || resp.statusCode, "body": _options } });
+            return;
+          }
+      });
+      httpsReq.write(post_data);
+      httpsReq.end();
+      }else{
+        (fc)({ "Error": { "code": "httpsOnly", "body": _options } });
+        return;
+      }
+
+    } else {
+      if (fc) {
+        (fc)({ "Error": { "code": "Invalid Url", "body": _options } });
+        return;
+      }
+    }
+  },
+  post2Apps: function (arr, payload, sc, fc) {
+    var _this = this;
+    if (arr && arr.length > 0) {
+      var _payload = (arr[0].preprocess || (function (p) { return p; }))(payload);
+      _this.post2App(arr[0].url, arr[0].apikey, arr[0].proxy, _payload, function () {
+        console_log("postedToApp" , arr[0]);
+        if (arr.length===1) {
+          sc.apply(this, arguments);
+        } else {
+          (arr[0].postprocess || (function (args) { return args; })).apply(this, arguments);
+          _this.post2Apps(arr.slice(1), payload, sc, fc);
+        }
+      }, function (err) {
+        console_log("payload" , JSON.stringify(arr[0]) ,"error", err);
+        if (arr.length===1) {
+          fc.apply(this, arguments);
+        } else {
+          (arr[0].postprocess || (function (args) { return args; })).apply(this, arguments);
+          _this.post2Apps(arr.slice(1), payload, sc, fc);
+        }
+      });
+    }
+  }
+  ,
+  post2Syniverse: function (_options, sc, fc) {
+    request(_options, function (err, response, body2) {
+        if ((!(response && (response.statusCode === 200 || response.statusCode === 201))) || err) {
+          if (fc) {
+            fc && fc(err);
+            return;
+          }
+        } else {
+          if (sc) {
+            sc && sc(body2);
+            return;
+          }
+        }
+  });
+  }
+
+
+
+}

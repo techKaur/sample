@@ -1,0 +1,194 @@
+var express = require('express');
+var db = require('./cassandraDB');
+global.now = function () {
+  var now = new Date();
+  var now_utc = new Date(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), now.getUTCHours(), now.getUTCMinutes(), now.getUTCSeconds(), now.getUTCMilliseconds());
+  return now_utc.toISOString();
+}
+const crypto = require('crypto');
+var request = require("request");
+var helmet = require('helmet');
+var querystring = require('querystring');
+var parseString = require('xml2js').parseString;
+var console = require("./logModule");
+const NS_PER_SEC = 1e9;
+
+var _options = {
+  "method": "POST",
+  "url": "https://text.mes.syniverse.com/SMSSend",
+  "port": 443,
+  "headers": {
+    "content-type": "application/x-www-form-urlencoded",
+    "cache-control": "no-cache",
+  }
+};
+var utils = require('./utils');
+//console.log("encryptedValue",utils.encrypt(''));
+//console.log("encryptedValue",utils.decrypt(''));
+var app = express();
+app.use(helmet());
+var bodyParser = require('body-parser');
+var outRules = require("./out-rules");
+app.use(bodyParser.json()); // for parsing application/json
+//app.use(bodyParser.urlencoded({ extended: true })); // for parsing application/x-www-form-urlencoded
+app.post('/', function (req, res) {
+  var startTime = process.hrtime();
+  var body = (req.body);
+  var tags = body.tags || [];
+  var from = body.fromAddress;
+  var to = body.toAddress;
+  var messageId = null;
+  var sourceSystem = req.headers.source;
+  var extTime = 0;
+  var dbTime = 0;
+  var isOldSchema = false;
+  var ptcFlag = false;
+  var excaFlag = false;
+
+  if (req.headers.source == ("ptc")) {
+    ptcFlag = true;
+  } else if (req.headers.source == ("expertCare")) {
+    excaFlag = true;
+  }
+  console.log("request", req.body);
+  if (tags.indexOf("syniverse") < 0) {
+    if (body.content && body.content.text) {
+      isOldSchema = true;
+      body.text = body.content.text;
+      // if (body.content.from && body.content.from.email) {
+      //   body.fromAddress = body.content.from.email.split("@")[0];
+      // } else {
+      //   body.fromAddress = 'AEGBT';
+      // }
+      body.fromAddress = 'AEGBT';
+      excaFlag = true;
+      if (body.recipients && body.recipients.length > 0 && body.recipients[0].address && body.recipients[0].address.email) {
+        body.toAddress = body.recipients[0].address.email.split('@')[0];
+        console.log("modifiedRequest", req.body);
+      } else {
+        var responseData = { _messages: [{ code: "ucp.content.insufficient", text: "No Recipients" }] };
+        sendResponse(from, to, startTime, dbTime, extTime, responseData, sourceSystem, res, isOldSchema);
+        //res.json({
+        // _messages: [{ code: "ucp.content.insufficient", text: "No Recipients" }]
+        //});
+        return;
+      }
+    } else {
+      //res.json({
+      var responseData = { _messages: [{ code: "ucp.content.insufficient", text: "No Tags" }] };
+      //});
+      sendResponse(from, to, startTime, dbTime, extTime, responseData, sourceSystem, res, isOldSchema);
+      return;
+    }
+  }
+
+  //Auto Identify the sender Code
+  body.fromAddress = body.fromAddress || 'AEGBT';
+  if (body.fromAddress == 'AEGBT') {
+    for (var i = 0; i < outRules.length; i++) {
+      if ((new RegExp(outRules[i].regx)).test(body.toAddress)) {
+        body.fromAddress = outRules[i].code;
+        console.log("flow", "Auto Identify Sender Code", "regex", outRules[i].regx, "country", outRules[i].country, "toAddress", body.toAddress, "fromAddress", body.fromAddress);
+        break;
+      }
+    }
+  }
+
+  var post_data = querystring.stringify({
+    user: process.env.SYNIVERSE_USERID || 4925
+    , pass: utils.decrypt(process.env.SYNIVERSE_PASSCODE || 'fdacd917fd7940fd0f07905bb9f6bf46:015e43fbe85363ae90dfdef7192623d3')
+    , smsfrom: body.fromAddress
+    , smsto: body.toAddress
+    , smsmsg: body.text
+  });
+
+  if (tags.indexOf("demo") >= 0 || process.env.APP_ENVIRONMENT != 'prod') {
+    post_data = querystring.stringify({
+      user: process.env.SYNIVERSE_DEMO_USERID || 4924
+      , pass: utils.decrypt(process.env.SYNIVERSE_DEMO_PASSCODE || 'e541b13e48e16b2650e306ad877da5a0:73b9d43f64555c6b9e1806bd8315beae')
+      , smsfrom: body.fromAddress
+      , smsto: body.toAddress
+      , smsmsg: body.text
+    });
+  }
+
+  _options.body = post_data;
+
+  if (tags.indexOf("debug") >= 0) {
+    //res.json({ "messageId": "debug.only" });
+    var responseData = { "messageId": "debug.only" }
+    sendResponse(from, to, startTime, dbTime, extTime, responseData, sourceSystem, res, isOldSchema);
+    return;
+  }
+
+
+  var data = {
+    "mobile": body.toAddress,
+    "ptc": ptcFlag,
+    "exca": excaFlag
+  };
+
+  //Register Mobile - If DB calls fail then Continue with Processing
+  var dbStartTime = process.hrtime();
+  db.putMobile(data, function (success) {
+    dbTime = getTimeTaken(dbStartTime);
+    console.log('databaseSuccess', success);
+  }, function (err) {
+    dbTime = getTimeTaken(dbStartTime);
+    console.log('data', data);
+    console.log('databaseError', err);
+  });
+
+  var extStartTime = process.hrtime();
+  console.log("ExtRequest", _options);
+  var req = request(_options, function (err, response, body2) {
+    extTime = getTimeTaken(extStartTime);
+    if (err) {
+      console.log("syniverseError", err);
+      sendResponse(from, to, startTime, dbTime, extTime, { "_messages": [{ code: "syn.req.error", text: err }] }, sourceSystem, res, isOldSchema);
+    } else {
+      parseString(body2, { explicitArray: false, ignoreAttrs: true, trim: true }, function (err, result) {
+        messageId = result.response.trackingid;
+        sendResponse(from, to, startTime, dbTime, extTime, { "messageId": result.response.trackingid }, sourceSystem, res, isOldSchema);
+      });
+    }
+  });
+  //1. garabagge collector
+  try {
+    global.gc();
+  } catch (e) {
+    console.log("catchGC", "You must run program with 'node --expose-gc index.js' or 'npm start'");
+    process.exit();
+  }
+
+  //2. Output Heap stats
+  var heapUsed = process.memoryUsage().heapUsed;
+  console.log("heapUsed", "Program is using " + heapUsed + " bytes of Heap.")
+});
+
+function sendResponse(from, to, startTime, dbTime, extTime, response, sourceSys, res, isOldSchema) {
+  var resTime = getTimeTaken(startTime);
+  console.log("fromAddress", from, "toAddress", to, "responseTime", resTime, "dbResponseTime", dbTime, "extResponseTime", extTime, "response", response, "sourceSystem", sourceSys);
+  if (isOldSchema) {
+    res.json({
+      "results": {
+        "total_rejected_recipients": 0,
+        "total_accepted_recipients": 1,
+        "id": response.messageId
+      }
+    });
+  } else {
+    res.json(response);
+  }
+}
+
+function getTimeTaken(startTime) {
+  var diff = process.hrtime(startTime);
+  var time_ns = diff[0] * NS_PER_SEC + diff[1];
+  //var timeTaken = time_ns + ' ns';
+  return time_ns;
+}
+
+app.listen(8080, function () {
+  console.log("startupPort", 8080);
+});
